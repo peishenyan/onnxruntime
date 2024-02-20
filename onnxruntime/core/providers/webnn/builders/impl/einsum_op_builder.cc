@@ -74,13 +74,14 @@ bool ParseEquationComponents(const InitializedTensorSet& initializers,
                      std::vector<uint32_t>& m_label_indices,
                      std::vector<Component>& m_components,
                      std::vector<uint32_t>& m_output_dimensions,
+                     uint32_t& num_labels,
                      const logging::Logger& logger) {
 
   // Parse the equation and mapping each axis into numeric indices
   std::map<char, uint32_t> label_maps;
   std::set<char> repeated_labels;
 
-  uint32_t current_label_idx = 0;
+  num_labels = 0;
   Component current_component = {};
   bool at_output = false;
   bool end_flag = false;
@@ -90,13 +91,13 @@ bool ParseEquationComponents(const InitializedTensorSet& initializers,
     char ch = *it;
 
     if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
-      const auto [i, inserted] = label_maps.insert({ch, current_label_idx});
+      const auto [i, inserted] = label_maps.insert({ch, num_labels});
       if (inserted) {
         if (at_output) {
           LOGS(logger, VERBOSE) << "Found label in equation output not matching any label from inputs.";
           return false;
         }
-        ++current_label_idx;
+        ++num_labels;
       }
       else if (!at_output) {
         repeated_labels.insert(ch);
@@ -156,6 +157,182 @@ bool ParseEquationComponents(const InitializedTensorSet& initializers,
     m_components.push_back(current_component);
   }
   return true;
+}
+
+
+void PairwiseOperandProcess(const std::vector<uint32_t>& m_label_indices,
+                     const std::vector<Component>& m_components,
+                     const std::vector<uint32_t>& m_output_dimensions,
+                     const uint32_t& num_lables
+                     const logging::Logger& logger) {
+
+  auto input_a_labels = m_components[0].GetLabels(m_label_indices);
+  auto input_b_labels = m_components[1].GetLabels(m_label_indices);
+  auto output_labels = m_components[2].GetLabels(m_label_indices);
+
+  std::map<uint32_t, int32_t> input_a_axes_map, input_b_axes_map, output_axes_map;
+
+  for (uint32_t i = 0; i < num_lables; ++i) {
+    input_a_axes_map[i] = input_b_axes_map[i] = output_axes_map[i] = -1;
+  }
+  int32_t index = 0;
+  for (auto axis : input_a_labels) {
+    input_a_axes_map[axis] = index;
+    index++;
+  }
+  index = 0;
+  for (auto axis : input_b_labels) {
+    input_b_axes_map[axis] = index;
+    index++;
+  }
+  index = 0;
+  for (auto axis : output_labels) {
+    output_axes_map[axis] = index;
+    index++;
+  }
+
+  // Inputs Reshape
+  std::vector<uint32_t> a_1, a_2, a_3, b_1, b_2, b_3;
+  uint32_t a_idx = input_a_labels.size();
+  uint32_t b_idx = input_b_labels.size();
+  bool a_flag = false;
+  bool b_flag = false;
+  uint32_t a_lack, b_lack;
+
+  for (uint32_t i = 0; i < num_lables; ++i) {
+    if (input_a_axes_map[i] != -1) {
+      if (input_b_axes_map[i] != -1) {
+        if (output_axes_map[i] != -1) { // (1,1,1) push back in the front
+          a_1.push_back(i);
+          b_1.push_back(i)
+        }
+        else { // (1,1,0) push back in the middle for b and end for a
+          a_3.push_back(i);
+          b_2.push_back(i);
+        }
+      }
+      else { // (1,0,x) push back in the middle for a. If more than one, push back in the front for a b
+        input_b_axes_map[i] = b_idx;
+        b_idx++;
+        if (a_flag) {
+          a_1.push_back(i);
+          b_1.push_back(i);
+        }
+        else {
+          a_2.push_back(i);
+          b_lack = i;
+          a_flag = true;
+        }
+      }
+    }
+    else {
+      input_a_axes_map[i] = a_idx;
+      a_idx++;
+      if (input_b_axes_map[i] != -1) { // (0,1,x) push back in the end for b.  If more than one, push back in the front for a b
+        if (b_flag) {
+          a_1.push_back(i);
+          b_1.push_back(i);
+        }
+        else {
+          b_3.push_back(i);
+          a_lack = i;
+          b_flag = true;
+        }
+      }
+    }
+  }
+
+  if (!a_flag) {
+    a_2.push_back(a_lack);
+  }
+  if (!b_flag) {
+    b_3.push_back(b_lack);
+  }
+
+  if (a_3.empty()) {
+    a_3.push_back(a_idx);
+    b_2.push_back(b_idx);
+    input_a_axes_map[a_idx] = a_idx;
+    input_b_axes_map[b_idx] = b_idx;
+  }
+
+  a_1.insert(a_1.end(), a_2.begin(), a_2.end());
+  a_1.insert(a_1.end(), a_3.begin(), a_3.end());
+  b_1.insert(b_1.end(), b_2.begin(), b_2.end());
+  b_1.insert(b_1.end(), b_3.begin(), b_3.end());
+
+  std::vector<uint32_t> permutation_a, permutation_b;
+
+  for (uint32_t i = 0; i < a_1.size(); ++i) {
+    permutation_a.push_back(static_cast<uint32_t>(input_a_axes_map[a_1[i]]));
+    permutation_b.push_back(static_cast<uint32_t>(input_b_axes_map[b_1[i]]));
+  }
+
+  const auto& input_defs = node.InputDefs();
+  emscripten::val input_a = model_builder.GetOperand(input_defs[0]->Name());
+  emscripten::val input_b = model_builder.GetOperand(input_defs[1]->Name());
+  if (input_a_labels.size() < a_1.size()) {
+    std::vector<int64_t> input_a_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_a_shape, logger), "Cannot get shape");
+    std::vector<uint32_t> new_a_shape = input_a_shape;
+    for (uint32_t index = 0; index < a_1.size() - input_a_labels.size(); ++index) {
+      new_a_shape.push_back(SafeInt<int32_t>(1));
+    }
+    input_a = model_builder.GetBuilder().call<emscripten::val>("reshape", input_a, emscripten::val::array(new_a_shape));
+  }
+  if (input_b_labels.size() < b_1.size()) {
+    std::vector<int64_t> input_b_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], input_b_shape, logger), "Cannot get shape");
+    std::vector<uint32_t> new_b_shape = input_b_shape;
+    for (uint32_t index = 0; index < b_1.size() - input_b_labels.size(); ++index) {
+      new_b_shape.push_back(SafeInt<int32_t>(1));
+    }
+    input_b = model_builder.GetBuilder().call<emscripten::val>("reshape", input_b, emscripten::val::array(new_b_shape));
+  }
+
+  // Inputs Transpose
+  emscripten::val options = emscripten::val::object();
+  options.set("permutation", emscripten::val::array(permutation_a));
+  input_a = model_builder.GetBuilder().call<emscripten::val>("transpose", input_a, options);
+  options.set("permutation", emscripten::val::array(permutation_b));
+  input_b = model_builder.GetBuilder().call<emscripten::val>("transpose", input_b, options);
+
+  // Matmul
+  emscripten::val output = emscripten::val::object();
+  output = model_builder.GetBuilder().call<emscripten::val>("matmul", input_a, input_b);
+  std::vector<uint32_t> output_indices = a_1;
+  output_indices.pop_back();
+  output_indices.push_back(b_1.back());
+
+  // Output Transpose
+  std::vector<uint32_t> target_output_indices = output_labels;
+  uint32_t p = target_output_indices.size();
+  std::vector<uint32_t> s(output_indices.size(), -1), t(output_indices.size(), -1), v(output_indices.size(), -1);
+  for (uint32_t i = 0; i < output_indices.size(); ++i) {
+    s[output_indices[i]] = i;
+    if (i < target_output_indices.size()) {
+      t[target_output_indices[i]] = i;
+    }
+  }
+  for (uint32_t i = 0; i < output_indices.size(); ++i) {
+    if (t[i] == -1) {
+      t[i] = p++;
+    }
+    v[s[i]] = t[i];
+  }
+
+  options.set("permutation", emscripten::val::array(v));
+  output = model_builder.GetBuilder().call<emscripten::val>("transpose", output, options);
+
+  // Output ReduceSum
+  std::vector<int32_t> axes_data;
+  for (uint32_t i = output_labels.size(); i < output_indices.size(); ++i) {
+    axes_data.push_back(SafeInt<int32_t>(i));
+  }
+  emscripten::val options_reduce = emscripten::val::object();
+  options_reduce.set("axes", emscripten::val::array(axes_data));
+  output = model_builder.GetBuilder().call<emscripten::val>("reduceSum", output, options_reduce);
+
 }
 
 RecognizedOperatorType DetermineRecognizedOperatorType(const std::vector<uint32_t>& m_label_indices,
@@ -257,8 +434,33 @@ Status EinsumOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   std::vector<uint32_t> m_label_indices;
   std::vector<Component> m_components;
   std::vector<uint32_t> m_output_dimensions;
+  uint32_t num_labels;
   ORT_RETURN_IF_NOT(ParseEquationComponents(initializers, node, equation, m_label_indices,
-      m_components, m_output_dimensions, logger), "Error parsing equation components.");
+      m_components, m_output_dimensions, num_labels, logger), "Error parsing equation components.");
+
+  if (m_components.size() == 2) { // one input
+    auto input_labels = m_components[0].GetLabels(m_label_indices);
+    auto output_labels = m_components[1].GetLabels(m_label_indices);
+    if (input_labels.size() == output_labels.size()) {
+      if (equals(input_labels, output_labels)) { // identity
+        return RecognizedOperatorType::Identity;
+      }
+      else {
+        return RecognizedOperatorType::Transpose;
+      }
+    }
+    else if (output_labels.empty()) { // scalar output, reduce
+      return RecognizedOperatorType::ReduceSum;
+    }
+
+  }
+  else if (m_components.size() == 3) { // two inputs
+    auto input_A_labels = m_components[0].GetLabels(m_label_indices);
+    auto input_B_labels = m_components[1].GetLabels(m_label_indices);
+    auto output_labels = m_components[2].GetLabels(m_label_indices);
+
+  }
+
 
   RecognizedOperatorType recognized_operator_type = DetermineRecognizedOperatorType(m_label_indices, m_components, m_output_dimensions);
 
@@ -446,9 +648,10 @@ bool EinsumOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers
   std::vector<uint32_t> m_label_indices;
   std::vector<Component> m_components;
   std::vector<uint32_t> m_output_dimensions;
+  uint32_t num_labels;
 
   if (!ParseEquationComponents(initializers, node, equation, m_label_indices,
-      m_components, m_output_dimensions, logger)) {
+      m_components, m_output_dimensions, num_labels, logger)) {
 
     LOGS(logger, VERBOSE) << "EinSum input equation is illegal.";
     return false;
