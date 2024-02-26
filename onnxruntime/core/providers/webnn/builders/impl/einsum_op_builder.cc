@@ -1,44 +1,6 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Copyright (c) Intel Corporation. All rights reserved.
 // Licensed under the MIT License.
-/*
-
-  ----------------------------------------------
-  I. For two inputs A,B and one output C
-  ----------------------------------------------
-
-  1. Transpose and Reshape
-
-  (0/1,0/1,0/1) means dim i whether appears in (A,B,C)
-  For new A, it has three segements [...a_1..., a_2, a_3], a_1 has multiple dims, a_2 and a_3 only have one dim respectively
-  For new B, it has three segements [...b_1..., b_2, b_3], b_1 has multiple dims, b_2 and b_3 only have one dim respectively
-  a_1 and b_1 are batch dims, and [a_2,a_3], [b_2,b_3] are for matmul
-
-  case (1,0,0) and (0,1,0): reduce, here we treat it as batch dimension, and reduceSum at the end.
-            add additional dim for B/A
-  case (1,1,1): batch dimension, put it in the front.
-  case (1,0,1): gemm dim for A, put it in a_2
-  case (0,1,1): gemm dim for B, put it in b_3
-  case (1,1,0): summation dim / gemm dim for both A and B, put it in a_3 and b_2
-
-  Attention:
-    # of (1,1,0) maybe > 1, flatten / reshape a_3 and b_2
-    # of (1,1,0) maybe = 0, add one addtional dim for a_3 and b_2
-
-
-  2. Matmul
-
-
-  3. ReduceSum
-
-
-
-  ----------------------------------------------
-  II. For one input and one output
-  ----------------------------------------------
-  According to the implementation of DML ReduceSum, Identity and Transpose,
-
-*/
 
 #include "core/common/safeint.h"
 #include "core/framework/tensorprotoutils.h"
@@ -74,16 +36,9 @@ class EinsumOpBuilder : public BaseOpBuilder {
 enum class RecognizedOperatorType {
   None,
   Identity,
-  Multiply,
-  OuterProduct,
-  MatMul,
-  MatMulTransposeA,
-  MatMulTransposeB,
-  MatMulNhcw,
-  MatMulNhcwTransposeA,
-  MatMulNhcwTransposeB,
   ReduceSum,
   Transpose,
+  Multiply,
   Others,
   Total,
 };
@@ -192,6 +147,7 @@ bool ParseEquationComponents(const InitializedTensorSet& initializers,
   return true;
 }
 
+// For two inputs A,B and one output C
 Status PairwiseOperandProcess(ModelBuilder& model_builder,
                               const Node& node,
                               const std::vector<uint32_t>& m_label_indices,
@@ -204,7 +160,28 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
   auto input_b_labels = m_components[1].GetLabels(m_label_indices);
   auto output_labels = m_components[2].GetLabels(m_label_indices);
 
-  std::map<uint32_t, int32_t> input_a_axes_map, input_b_axes_map, output_axes_map;  // The index in input/output of the dim index
+  /*
+  Step 1. Transpose and Reshape
+
+  (0/1,0/1,0/1) means dim i whether appears in (A,B,C)
+  For new A, it has three segements [...a_1..., a_2, a_3], a_1 has multiple dims, a_2 and a_3 only have one dim respectively
+  For new B, it has three segements [...b_1..., b_2, b_3], b_1 has multiple dims, b_2 and b_3 only have one dim respectively
+  a_1 and b_1 are batch dims, and [a_2,a_3], [b_2,b_3] are for matmul
+
+  case (1,0,0) and (0,1,0): reduce, here we treat it as batch dimension, and reduceSum at the end.
+            add additional dim for B/A
+  case (1,1,1): batch dimension, put it in the front.
+  case (1,0,1): gemm dim for A, put it in a_2
+  case (0,1,1): gemm dim for B, put it in b_3
+  case (1,1,0): summation dim / gemm dim for both A and B, put it in a_3 and b_2
+
+  Attention:
+    # of (1,1,0) maybe > 1, flatten / reshape a_3 and b_2
+    # of (1,1,0) maybe = 0, add one addtional dim for a_3 and b_2
+  */
+
+  // The index in input/output of the dim index
+  std::map<uint32_t, int32_t> input_a_axes_map, input_b_axes_map, output_axes_map;
 
   for (uint32_t i = 0; i <= num_labels + 1; ++i) {
     input_a_axes_map[i] = input_b_axes_map[i] = output_axes_map[i] = -1;
@@ -232,14 +209,17 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
   for (uint32_t i = 0; i < num_labels; ++i) {
     if (input_a_axes_map[i] != -1) {
       if (input_b_axes_map[i] != -1) {
-        if (output_axes_map[i] != -1) {  // (1,1,1) push back in the front
+        if (output_axes_map[i] != -1) {
+          // The index in input/output of the dim index
           a_1.push_back(i);
           b_1.push_back(i);
-        } else {  // (1,1,0) push back in the middle for b and end for a
+        } else {
+          // (1,1,0) push back in the middle for b and end for a
           a_3.push_back(i);
           b_2.push_back(i);
         }
-      } else {  // (1,0,x) push back in the middle for a. If more than one, push back in the front for a b
+      } else {
+        // (1,0,x) push back in the middle for a. If more than one, push back in the front for a, b.
         if (a_flag) {
           a_1.push_back(i);
           b_1.push_back(i);
@@ -320,17 +300,6 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     input_b = model_builder.GetBuilder().call<emscripten::val>("reshape", input_b, emscripten::val::array(new_b_shape));
   }
 
-  std::stringstream ss;
-  for (size_t i = 0; i < permutation_a.size(); ++i) {
-    if (i != 0)
-      ss << ",";
-    ss << permutation_a[i];
-  }
-  std::string sss = ss.str();
-  emscripten::val console = emscripten::val::global("console");
-  console.call<void>("log", emscripten::val("A permutation is: "));
-  console.call<void>("log", emscripten::val(sss));
-
   // Inputs Transpose
   std::vector<uint32_t> sequence(permutation_a.size());
   std::iota(sequence.begin(), sequence.end(), 0);
@@ -339,24 +308,13 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     options.set("permutation", emscripten::val::array(permutation_a));
     input_a = model_builder.GetBuilder().call<emscripten::val>("transpose", input_a, options);
   }
-
-  std::stringstream tt;
-  for (size_t i = 0; i < permutation_b.size(); ++i) {
-    if (i != 0)
-      tt << ",";
-    tt << permutation_b[i];
-  }
-  std::string ttt = tt.str();
-  console.call<void>("log", emscripten::val("B permutation is: "));
-  console.call<void>("log", emscripten::val(ttt));
-
   if (permutation_b != sequence) {
     emscripten::val options = emscripten::val::object();
     options.set("permutation", emscripten::val::array(permutation_b));
     input_b = model_builder.GetBuilder().call<emscripten::val>("transpose", input_b, options);
   }
 
-  // Input Reshape: if the number of (1,1,0) > 1, flatten the middle for b and end for a
+  // Input Reshape: if the number of (1,1,0) > 1, flatten the b_2 and a_3 dims.
   if (a_3.size() > 1) {
     if (new_a_shape.empty()) {
       std::vector<int64_t> input_a_shape;
@@ -397,21 +355,23 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     input_b = model_builder.GetBuilder().call<emscripten::val>("reshape", input_b, emscripten::val::array(new_b_shape));
   }
 
-  // Matmul
+  // Step 2. Matmul
   output = model_builder.GetBuilder().call<emscripten::val>("matmul", input_a, input_b);
   std::vector<uint32_t> output_indices = a_1;
   output_indices.push_back(a_2.back());
   output_indices.push_back(b_3.back());
 
-  // Output Transpose:
   /*
-    sequence A[] -> sequence B[] : permutation P[]
-    A[S[i]] = i, B[T[i]] = i
-    P[S[i]] = T[i]
+    Step 3. Output Transpose:
+    Use the following fast permutation calculation algorithm
+    to calculate the permutation of transpose.
+    sequence X[] -> sequence Y[] : permutation P[]
+    X[S[i]] = i, Y[T[i]] = i, P[S[i]] = T[i]
+    output_indices is X and target_output_indices is Y
   */
   std::vector<uint32_t> target_output_indices(output_labels.begin(), output_labels.end());
 
-  // map to 0 ~ n-1
+  // map output dim labels to 0 ~ n-1
   std::vector<uint32_t> arr(output_indices.begin(), output_indices.end());
   std::map<uint32_t, uint32_t> mapping;
   std::sort(arr.begin(), arr.end());
@@ -442,16 +402,6 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     v[static_cast<uint32_t>(s[i])] = static_cast<uint32_t>(t[i]);
   }
 
-  std::stringstream rr;
-  for (size_t i = 0; i < v.size(); ++i) {
-    if (i != 0)
-      rr << ",";
-    rr << v[i];
-  }
-  std::string rrr = rr.str();
-  console.call<void>("log", emscripten::val("C permutation is: "));
-  console.call<void>("log", emscripten::val(rrr));
-
   std::vector<uint32_t> sequence_o(output_indices.size());
   std::iota(sequence_o.begin(), sequence_o.end(), 0);
   if (v != sequence_o) {
@@ -460,7 +410,7 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     output = model_builder.GetBuilder().call<emscripten::val>("transpose", output, options);
   }
 
-  // Output ReduceSum
+  // Step 4. Output ReduceSum
   if (output_labels.size() < output_indices.size()) {
     std::vector<int32_t> axes_data;
     for (uint32_t i = output_labels.size(); i < output_indices.size(); ++i) {
@@ -481,10 +431,6 @@ RecognizedOperatorType DetermineRecognizedOperatorType(const std::vector<uint32_
   auto equals = [](gsl::span<const uint32_t> a, gsl::span<const uint32_t> b) {
     return std::equal(a.begin(), a.end(), b.begin(), b.end());
   };
-
-  // auto as_span = [](std::initializer_list<uint32_t> il) {
-  //   return gsl::make_span(il.begin(), il.size());
-  // };
 
   std::array<uint32_t, 3> component_ranks;
   if (m_components.size() > component_ranks.size()) {
@@ -513,38 +459,6 @@ RecognizedOperatorType DetermineRecognizedOperatorType(const std::vector<uint32_
   }
 
   return RecognizedOperatorType::Others;
-  // const RecognizedOperatorInfo recognized_operators[] = {
-  //   {RecognizedOperatorType::MatMul,                {2,2,2},{0,1, 1,2, 0,2}}, // ik,kj->ij
-  //   {RecognizedOperatorType::MatMul,                {3,3,3},{0,1,2, 0,2,3, 0,1,3}}, // bik,bkj->bij
-  //   {RecognizedOperatorType::MatMul,                {4,4,4},{0,1,2,3, 0,1,3,4, 0,1,2,4}}, // abik,abkj->abij
-  //   {RecognizedOperatorType::OuterProduct,          {1,1,2},{0, 1, 0,1}}, // i,j->ij
-  //   {RecognizedOperatorType::MatMulTransposeA,      {2,2,2},{0,1, 0,2, 1,2}}, // ji,jk->ik
-  //   {RecognizedOperatorType::MatMulTransposeA,      {3,3,3},{0,1,2, 0,1,3, 0,2,3}}, // bji,bjk->bik
-  //   {RecognizedOperatorType::MatMulTransposeA,      {4,4,4},{0,1,2,3, 0,1,2,4, 0,1,3,4}}, // abji,abjk->abik
-  //   {RecognizedOperatorType::MatMulTransposeB,      {2,2,2},{0,1, 2,1, 0,2}}, // ij,kj->ik
-  //   {RecognizedOperatorType::MatMulTransposeB,      {3,3,3},{0,1,2, 0,3,2, 0,1,3}}, // bij,bkj->bik
-  //   {RecognizedOperatorType::MatMulTransposeB,      {4,4,4},{0,1,2,3, 0,1,4,3, 0,1,2,4}}, // abij,abkj->abik
-  //   {RecognizedOperatorType::MatMulNhcw,            {4,4,4},{0,1,2,3, 0,3,2,4, 0,1,2,4}}, // aibj,ajbk->aibk
-  //   {RecognizedOperatorType::MatMulNhcwTransposeA,  {4,4,4},{0,1,2,3, 0,1,2,4, 0,3,2,4}}, // ajbi,ajbk->aibk
-  //   {RecognizedOperatorType::MatMulNhcwTransposeB,  {4,4,4},{0,1,2,3, 0,4,2,3, 0,1,2,4}}, // aibj,akbj->aibk
-  //   {RecognizedOperatorType::ReduceSum,             {2,1  },{0,1, 0}}, //ij->i
-  //   {RecognizedOperatorType::ReduceSum,             {2,1  },{0,1, 1}}, //ij->j
-  // };
-
-  // for (auto& recognized_operator: recognized_operators) {
-  //   if (equals(m_label_indices, as_span(recognized_operator.label_indices))
-  //   && m_components.size() == recognized_operator.component_ranks.size()) {
-  //     for (size_t i = 0; i < m_components.size(); ++i) {
-  //       component_ranks[i] = m_components[i].GetDimensionCount();
-  //     }
-
-  //     if (equals(gsl::make_span(component_ranks.data(), m_components.size()), as_span(recognized_operator.component_ranks))) {
-  //       return recognized_operator.recognized_operator_type;
-  //     }
-  //   }
-  // }
-
-  // return RecognizedOperatorType::Others;
 }
 
 // Add operator related.
@@ -580,102 +494,6 @@ Status EinsumOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       emscripten::val b = model_builder.GetOperand(node.InputDefs()[b_idx]->Name());
       output = model_builder.GetBuilder().call<emscripten::val>("mul", a, b);
     } break;
-
-    case RecognizedOperatorType::OuterProduct: {
-      const size_t a_idx = 0, b_idx = 1;
-      emscripten::val a = model_builder.GetOperand(node.InputDefs()[a_idx]->Name());
-      emscripten::val b = model_builder.GetOperand(node.InputDefs()[b_idx]->Name());
-
-      std::vector<int64_t> a_shape, b_shape;
-      ORT_RETURN_IF_NOT(GetShape(*input_defs[0], a_shape, logger), "Cannot get shape");
-      ORT_RETURN_IF_NOT(GetShape(*input_defs[1], b_shape, logger), "Cannot get shape");
-
-      std::vector<int64_t> new_a_shape = a_shape;
-      new_a_shape.push_back(static_cast<uint32_t>(1));
-      std::vector<int64_t> new_b_shape = b_shape;
-      new_b_shape.insert(new_b_shape.begin(), static_cast<uint32_t>(1));
-
-      emscripten::val new_a = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                                               a, emscripten::val::array(new_a_shape));
-      emscripten::val new_b = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                                               b, emscripten::val::array(new_b_shape));
-
-      emscripten::val options = emscripten::val::object();
-
-      output = model_builder.GetBuilder().call<emscripten::val>("gemm", a, b);
-    } break;
-
-    case RecognizedOperatorType::MatMulTransposeA:
-    case RecognizedOperatorType::MatMulTransposeB:
-    case RecognizedOperatorType::MatMul: {
-      const size_t a_idx = 0, b_idx = 1;
-      emscripten::val a = model_builder.GetOperand(node.InputDefs()[a_idx]->Name());
-      emscripten::val b = model_builder.GetOperand(node.InputDefs()[b_idx]->Name());
-
-      if (recognized_operator_type == RecognizedOperatorType::MatMulTransposeA) {
-        std::vector<int64_t> input_shape;
-        ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
-        auto input_dims = static_cast<int64_t>(input_shape.size());
-
-        std::vector<uint32_t> permutation;
-
-        for (uint32_t i = 0; i < input_dims - 2; ++i)
-          permutation.push_back(i);
-
-        permutation.push_back(static_cast<uint32_t>(input_dims - 1));
-        permutation.push_back(static_cast<uint32_t>(input_dims - 2));
-
-        emscripten::val options = emscripten::val::object();
-        options.set("permutation", emscripten::val::array(permutation));
-        a = model_builder.GetBuilder().call<emscripten::val>("transpose", a, options);
-      } else if (recognized_operator_type == RecognizedOperatorType::MatMulTransposeB) {
-        std::vector<int64_t> input_shape;
-        ORT_RETURN_IF_NOT(GetShape(*input_defs[1], input_shape, logger), "Cannot get shape");
-        auto input_dims = input_shape.size();
-
-        std::vector<int64_t> permutation;
-
-        for (int64_t i = 0; i < input_dims - 2; ++i)
-          permutation.push_back(i);
-
-        permutation.push_back(input_dims - 1);
-        permutation.push_back(input_dims - 2);
-
-        emscripten::val options = emscripten::val::object();
-        options.set("permutation", emscripten::val::array(permutation));
-        b = model_builder.GetBuilder().call<emscripten::val>("transpose", b, options);
-      }
-
-      output = model_builder.GetBuilder().call<emscripten::val>("matmul", a, b);
-    } break;
-
-    case RecognizedOperatorType::MatMulNhcw:
-    case RecognizedOperatorType::MatMulNhcwTransposeA:
-    case RecognizedOperatorType::MatMulNhcwTransposeB: {
-      const size_t a_idx = 0, b_idx = 1;
-      emscripten::val a = model_builder.GetOperand(node.InputDefs()[a_idx]->Name());
-      emscripten::val b = model_builder.GetOperand(node.InputDefs()[b_idx]->Name());
-
-      emscripten::val options = emscripten::val::object();
-      std::vector<int64_t> permutation = {0, 2, 1, 3};
-      std::vector<int64_t> permutation_a = {0, 2, 1, 3};
-      std::vector<int64_t> permutation_b = {0, 2, 1, 3};
-      if (recognized_operator_type == RecognizedOperatorType::MatMulNhcwTransposeA) {
-        permutation_a = {0, 2, 3, 1};
-      } else if (recognized_operator_type == RecognizedOperatorType::MatMulNhcwTransposeB) {
-        permutation_b = {0, 2, 3, 1};
-      }
-
-      options.set("permutation", emscripten::val::array(permutation_a));
-      a = model_builder.GetBuilder().call<emscripten::val>("transpose", a, options);
-      options.set("permutation", emscripten::val::array(permutation_b));
-      b = model_builder.GetBuilder().call<emscripten::val>("transpose", b, options);
-      output = model_builder.GetBuilder().call<emscripten::val>("matmul", a, b);
-
-      options.set("permutation", emscripten::val::array(permutation));
-      output = model_builder.GetBuilder().call<emscripten::val>("transpose", output, options);
-    } break;
-
     case RecognizedOperatorType::ReduceSum: {
       auto kept_axes = m_components.back().GetLabels(m_label_indices);
       assert(kept_axes.size() <= 1);
@@ -705,7 +523,6 @@ Status EinsumOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
       output = model_builder.GetBuilder().call<emscripten::val>("reduceSum", input, options);
     } break;
-
     case RecognizedOperatorType::Transpose: {
       emscripten::val input = model_builder.GetOperand(node.InputDefs()[0]->Name());
       // Transpose via input strides. The output tensor is not strided.
