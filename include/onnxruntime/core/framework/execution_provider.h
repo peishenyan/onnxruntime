@@ -118,6 +118,9 @@ class IExecutionProvider {
   GetCapability(const onnxruntime::GraphViewer& graph_viewer,
                 const IKernelLookup& kernel_lookup) const;
 
+  virtual std::vector<std::unique_ptr<ComputeCapability>>
+  PostGetCapability(const onnxruntime::GraphViewer& graph_viewer,
+                const IKernelLookup& kernel_lookup) const;
   /**
      Get kernel registry per execution provider type.
      The KernelRegistry share pointer returned is shared across sessions.

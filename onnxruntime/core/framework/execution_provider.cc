@@ -27,6 +27,22 @@ IExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph,
   return result;
 }
 
+std::vector<std::unique_ptr<ComputeCapability>>
+IExecutionProvider::PostGetCapability(const onnxruntime::GraphViewer& graph,
+                                  const IKernelLookup& kernel_lookup) const {
+  std::vector<std::unique_ptr<ComputeCapability>> result;
+  for (const auto& node : graph.Nodes()) {
+    if (const KernelCreateInfo* kernel_create_info = kernel_lookup.LookUpKernel(node);
+        kernel_create_info != nullptr) {
+      std::unique_ptr<IndexedSubGraph> sub_graph = std::make_unique<IndexedSubGraph>();
+      sub_graph->nodes.push_back(node.Index());
+      result.push_back(std::make_unique<ComputeCapability>(std::move(sub_graph)));
+    }
+  }
+
+  return result;
+}
+
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
 common::Status IExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& /*fused_nodes_and_graphs*/,
                                            std::vector<NodeComputeInfo>& /*node_compute_funcs*/) {

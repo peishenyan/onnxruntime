@@ -66,6 +66,23 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
                                       const IKernelLookup& /*kernel_registries*/) const {
   std::vector<std::unique_ptr<ComputeCapability>> result;
 
+  const auto& logger = *GetLogger();
+  const auto node_groups = webnn::GetSupportedNodes(graph_viewer, wnn_builder_, wnn_device_type_, logger);
+  for (const auto& group : node_groups) {
+    for (auto& node_index : group) {
+      auto sub_graph = std::make_unique<IndexedSubGraph>();
+      sub_graph->nodes.push_back(node_index);
+      result.emplace_back(std::make_unique<ComputeCapability>(std::move(sub_graph)));
+    }
+  }
+  return result;
+}
+
+std::vector<std::unique_ptr<ComputeCapability>>
+WebNNExecutionProvider::PostGetCapability(const onnxruntime::GraphViewer& graph_viewer,
+                                      const IKernelLookup& /*kernel_registries*/) const {
+  std::vector<std::unique_ptr<ComputeCapability>> result;
+
   // For subgraph which is the attribute of the control flow nodes, part of its initializers are stored in its
   // ancestor graphs as common initializers shared for other subgraphs. We need to collect all of them used for
   // identifying the required initializer names and storing into 'meta_def->constant_initializers'.

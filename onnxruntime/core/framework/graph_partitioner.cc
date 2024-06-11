@@ -18,6 +18,8 @@
 #include "core/graph/model.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 
+#include <emscripten/val.h>
+
 // uncomment this line to count non-CUDA ops in ONNX domain
 // #define COUNT_NON_CUDA_OPS
 
@@ -133,6 +135,21 @@ struct GetCapabilityForEPParams {
 #endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
 };
 
+auto post_get_capabilities = [](const IExecutionProvider& ep,
+                           const GraphViewer& graph_viewer,
+                           const IExecutionProvider::IKernelLookup& kernel_lookup) {
+  auto capabilities = ep.PostGetCapability(graph_viewer, kernel_lookup);
+
+  // In theory an EP could return an empty capability. Remove those.
+  capabilities.erase(std::remove_if(capabilities.begin(), capabilities.end(),
+                                    [](const std::unique_ptr<ComputeCapability>& capability) {
+                                      return !capability || !capability->sub_graph;
+                                    }),
+                     capabilities.end());
+
+  return capabilities;
+};
+
 auto get_capabilities = [](const IExecutionProvider& ep,
                            const GraphViewer& graph_viewer,
                            const IExecutionProvider::IKernelLookup& kernel_lookup) {
@@ -173,6 +190,99 @@ static Status GetCapabilityForEP(const GetCapabilityForEPParams& params) {
   {
     const GraphViewer graph_viewer(graph);
     capabilities = get_capabilities(current_ep, graph_viewer, kernel_lookup);
+
+    if (capabilities.empty()) {
+      return Status::OK();
+    }
+  }
+
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  // Run layout transformer for EPs with preferred layout of NHWC
+  // CPU EP layout transformation happens later when level 3 transformers are run.
+  if (params.mode != GraphPartitioner::Mode::kAssignOnly && params.transform_layout.get() &&
+      current_ep.GetPreferredLayout() == DataLayout::NHWC) {
+    for (auto& capability : capabilities) {
+      TryAssignNodes(graph, *capability->sub_graph, ep_type);
+    }
+
+    const NodeIndex first_new_node = graph.MaxNodeIndex();
+
+    // Perform layout transformation on the specific EP assigned graph
+    bool modified = false;
+    ORT_RETURN_IF_ERROR(params.transform_layout(graph, modified, current_ep, params.debug_graph_fn));
+
+    // It is possible some new nodes are introduced during transformation. These nodes can be either existing nodes
+    // which are reconstructed to update domain or completely new nodes which are necessary for layout transformation.
+    // we always give GetCapability the second call as long as capabilities is not empty. GetCapability have different
+    // behaviors for first/second call, the first call only tag those nodes supported by this EP and then
+    // assigned by `AssignNodes`, the second call will do some node processing and
+    // node fusion whenever ops were layout-sensitive or not.
+    // So we are calling GetCapability twice here to make things simple and finish the following procedures;
+    // 1. To process new nodes introduced by transform_layout function.
+    // 2. To do Op-fusion and graph optimization
+    // 3. QDQ node-group fusion
+
+    const NodeIndex end_node = graph.MaxNodeIndex();
+
+    capabilities.clear();
+
+    const GraphViewer graph_viewer(graph);
+    capabilities = get_capabilities(current_ep, graph_viewer, kernel_lookup);
+
+    // all nodes with an index >= first_new_node with domain of kMSInternalNHWCDomain should be in the capabilities
+    InlinedHashSet<NodeIndex> new_nodes_in_capabilities;
+    for (const auto& capability : capabilities) {
+      for (auto node_index : capability->sub_graph->nodes) {
+        if (node_index >= first_new_node) {
+          new_nodes_in_capabilities.insert(node_index);
+        }
+      }
+    }
+
+    for (NodeIndex idx = first_new_node; idx < end_node; ++idx) {
+      const Node* node = graph.GetNode(idx);
+      if (node != nullptr && node->Domain() == kMSInternalNHWCDomain) {
+        if (new_nodes_in_capabilities.count(node->Index()) == 0) {
+          return ORT_MAKE_STATUS(
+              ONNXRUNTIME, FAIL,
+              "Node '", node->Name(), "' OpType:", node->OpType(), " with domain:", kMSInternalNHWCDomain,
+              " was inserted using the NHWC format as requested by ", ep_type, ", but was not selected",
+              " by that EP. This means the graph is now invalid as there will not be an EP able to run the node."
+              " This could be a bug in layout transformer, or in the GetCapability implementation of the EP.");
+        }
+      }
+    }
+  }
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  return Status::OK();
+}
+
+
+static Status PostGetCapabilityForEP(const GetCapabilityForEPParams& params) {
+  auto& current_ep = params.current_ep.get();
+  const auto& ep_type = current_ep.Type();
+
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  if (current_ep.GetPreferredLayout() == DataLayout::NHWC && !params.transform_layout.get()) {
+    LOGS_DEFAULT(WARNING) << ep_type << " cannot be used with this model due to its ONNX opset not being supported by "
+                                        "the layout transformer.";
+    return Status::OK();
+  }
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  const auto& kernel_registry_mgr = params.kernel_registry_mgr.get();
+  const auto kernel_registries_for_ep = kernel_registry_mgr.GetKernelRegistriesByProviderType(ep_type);
+  const KernelLookup kernel_lookup{ep_type,
+                                   kernel_registries_for_ep,
+                                   kernel_registry_mgr.GetKernelTypeStrResolver()};
+
+  auto& graph = params.graph.get();
+  auto& capabilities = params.capabilities.get();
+
+  {
+    const GraphViewer graph_viewer(graph);
+    capabilities = post_get_capabilities(current_ep, graph_viewer, kernel_lookup);
 
     if (capabilities.empty()) {
       return Status::OK();
@@ -399,6 +509,181 @@ static Status PartitionOnnxFormatModelImpl(Graph& graph, FuncManager& func_mgr,
       std::cref(debug_graph_fn)};
 
   ORT_RETURN_IF_ERROR(GetCapabilityForEP(get_capability_params));
+  if (capabilities.empty()) {
+    return Status::OK();
+  }
+
+  const std::string& type = current_ep.Type();
+  auto fusion_style = current_ep.GetFusionStyle();
+  std::vector<Node*> nodes_to_compile;
+
+  // The fused node may map to an existing kernel, so it is fused but doesn't need to be compiled
+  // But we still need to finalize the graph fusion for those nodes.
+  std::vector<Node*> nodes_to_complete_fuse;
+  std::vector<std::unique_ptr<ComputeCapability>> capabilities_to_complete_fuse;
+
+  // filter out the ComputeCapability instances that do not need compiling so we have a std::vector that's 1:1 with
+  // nodes_to_compile.
+  std::vector<std::unique_ptr<ComputeCapability>> capabilities_to_compile;
+  capabilities_to_compile.reserve(std::count_if(capabilities.cbegin(), capabilities.cend(),
+                                                [](const std::unique_ptr<ComputeCapability>& entry) {
+                                                  return entry != nullptr &&
+                                                         entry->sub_graph != nullptr &&
+                                                         entry->sub_graph->GetMetaDef() != nullptr;
+                                                }));
+  for (auto& capability : capabilities) {
+    Node* n = PlaceNode(graph, *capability->sub_graph, fusion_style, type, mode, fused_node_unique_id);
+    if (n != nullptr) {
+      // searching in kernel registries, if no kernel registered for the fused_node, use compile approach
+      if (!KernelRegistryManager::HasImplementationOf(kernel_registry_mgr, *n, type)) {
+        nodes_to_compile.push_back(n);
+        capabilities_to_compile.push_back(std::move(capability));
+      } else {
+        // there is a predefined kernel for the fused node. doesn't need compile, but need to complete the fusing.
+        nodes_to_complete_fuse.push_back(n);
+        capabilities_to_complete_fuse.push_back(std::move(capability));
+      }
+    }
+  }
+
+  // NOTE: if mode_ is kAssignOnly, nodes_to_compile will be empty at this point due to logic in PlaceNode
+  // even with single node, EP might still want to compile it.
+  // for example, it want to JIT an optimized kernel for LSTM with a given shape.
+  if (!nodes_to_compile.empty()) {
+    std::vector<NodeComputeInfo> node_compute_funcs;
+    // !!! The Function style fusion is deprecated.
+    if (fusion_style == IExecutionProvider::FusionStyle::Function) {
+      // Create a Function based node where the fused nodes have a new Graph instance.
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, type, "The Function Style fusion is deprecated.");
+    } else {
+      // temporary storage for the GraphViewer for each IndexedSubGraph
+      std::vector<std::unique_ptr<GraphViewer>> viewers;
+      viewers.reserve(nodes_to_compile.size());
+      std::vector<IExecutionProvider::FusedNodeAndGraph> nodes_and_viewers;
+      nodes_and_viewers.reserve(nodes_to_compile.size());
+
+      for (size_t j = 0, end = nodes_to_compile.size(); j < end; j++) {
+        auto* node = nodes_to_compile[j];
+        const auto& cur_capability = *capabilities_to_compile[j];
+        viewers.push_back(std::make_unique<GraphViewer>(graph, *cur_capability.sub_graph));
+        nodes_and_viewers.push_back(IExecutionProvider::FusedNodeAndGraph{*node, *viewers.back()});
+      }
+
+      ORT_RETURN_IF_ERROR(current_ep.Compile(nodes_and_viewers, node_compute_funcs));
+
+      if (node_compute_funcs.size() != nodes_to_compile.size()) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, type, " did not return correct number of compiled functions");
+      }
+
+      for (size_t j = 0, end = nodes_to_compile.size(); j < end; j++) {
+        auto* node = nodes_to_compile[j];
+
+        ORT_RETURN_IF_ERROR(func_mgr.AddFuncInfo(node->Name(), std::move(node_compute_funcs[j])));
+
+        const auto& cur_capability = capabilities_to_compile[j];
+        const IndexedSubGraph& indexed_sub_graph = *cur_capability->sub_graph;
+        const IndexedSubGraph::MetaDef& metadef = *indexed_sub_graph.GetMetaDef();
+
+        // create the func kernel for the name in the MetaDef. this is also the node name and that name that will
+        // used as the key in the FuncManager entry. We need the registry to own the KernelCreateInfo that is
+        // used by SessionState
+        KernelDefBuilder builder;
+        BuildFusedKernelDef(builder, metadef, type);
+        ORT_RETURN_IF_ERROR(fused_kernel_registry.Register(
+            builder,
+            [](FuncManager& func_mgr, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
+              return FunctionKernel::Create(func_mgr, info, out);
+            }));
+
+        // now that we're done compiling we can remove the original nodes from the Graph and wire in the new one
+        graph.FinalizeFuseSubGraph(indexed_sub_graph, *node);
+      }
+    }
+  }
+
+  if (!nodes_to_complete_fuse.empty()) {
+    for (size_t j = 0, end = nodes_to_complete_fuse.size(); j < end; j++) {
+      auto* node = nodes_to_complete_fuse[j];
+
+      const auto& cur_capability = capabilities_to_complete_fuse[j];
+      const IndexedSubGraph& indexed_sub_graph = *cur_capability->sub_graph;
+
+      // now that we're done compiling we can remove the original nodes from the Graph and wire in the new one
+      graph.FinalizeFuseSubGraph(indexed_sub_graph, *node);
+    }
+  }
+
+  // if this is the main graph call Resolve to put the Graph back into a guaranteed good state
+  // TODO: Graph::FuseSubGraph and Graph::FinalizeFuseSubGraph should now create valid edges so this call to
+  // Graph::Resolve should not be required. Need to test to validate that, especially if node being fused
+  // was a control flow node with its own subgraph as more than just the edges may need updating.
+  if (!graph.IsSubgraph()) {
+    ORT_RETURN_IF_ERROR(graph.Resolve());
+  }
+
+  // For some cases, like fp16 on cpu, right now we don't have any kernel support that.
+  // But we will insert cast op to run the model, so skip the error checking here.
+  // If after graph transform phase, the node still not assigned, we will report error
+  // during kernel creation phase.
+#ifdef COUNT_NON_CUDA_OPS
+  for (auto& node : graph.Nodes()) {
+    if (node.GetExecutionProviderType() != kCudaExecutionProvider &&
+        node.Domain() != kMLDomain &&
+        node.Domain() != kMSDomain)
+      non_cuda.AddOp(node.OpType());
+  }
+#endif
+
+  return Status::OK();
+}
+
+static Status PostPartitionOnnxFormatModelImpl(Graph& graph, FuncManager& func_mgr,
+                                           KernelRegistryManager& kernel_registry_mgr,
+                                           KernelRegistry& fused_kernel_registry,
+                                           IExecutionProvider& current_ep,
+                                           GraphPartitioner::Mode mode,
+                                           int& fused_node_unique_id,
+                                           const layout_transformation::TransformLayoutFunction& transform_layout_fn,
+                                           const layout_transformation::DebugGraphFn& debug_graph_fn) {
+  // handle testing edge case where optimizers or constant lifting results in graph with no nodes.
+  // doing it here saves all providers checking for this in GetCapability
+  if (graph.NumberOfNodes() == 0) {
+    return Status::OK();
+  }
+
+  // recurse into nested graphs first to partition bottom up.
+  for (auto& node : graph.Nodes()) {
+    for (auto& entry : node.GetAttributeNameToMutableSubgraphMap()) {
+      Graph* subgraph = entry.second;
+      // we pass through the FuncManager from the top level graph
+      ORT_RETURN_IF_ERROR(PostPartitionOnnxFormatModelImpl(*subgraph, func_mgr, kernel_registry_mgr,
+                                                       fused_kernel_registry, current_ep, mode, fused_node_unique_id,
+                                                       transform_layout_fn, debug_graph_fn));
+    }
+  }
+
+  // If an execution provider returns the capability that it can run a sub-graph,
+  // onnxruntime will fuse the sub-graph into a function node. For compilation
+  // based execution providers (one which needs to compile graph at runtime.
+  // Indicated by need_compile flag), onnxruntime will invoke the "Compile" method
+  // to get compiled binary. There are two mode of compile, one is return the entry
+  // point to the compiled binary directly, another is export the compiled binary to
+  // shared library for future reuse.
+
+  // TODO: when the graph contains a function node, and user passes in the dll which could
+  // run the function by SessionOption, we should create a function kernel for it and
+  // delegate the compute to the functions inside the dlls.
+  std::vector<std::unique_ptr<ComputeCapability>> capabilities;
+  const auto get_capability_params = GetCapabilityForEPParams{
+      std::ref(graph),
+      std::cref(kernel_registry_mgr),
+      std::ref(current_ep),
+      std::ref(capabilities),
+      mode,
+      std::cref(transform_layout_fn),
+      std::cref(debug_graph_fn)};
+
+  ORT_RETURN_IF_ERROR(PostGetCapabilityForEP(get_capability_params));
   if (capabilities.empty()) {
     return Status::OK();
   }
@@ -760,6 +1045,41 @@ static Status PartitionOnnxFormatModel(const PartitionParams& partition_params, 
   return Status::OK();
 }
 
+static Status PostPartitionOnnxFormatModel(const PartitionParams& partition_params, GraphPartitioner::Mode mode,
+                                       const ExecutionProviders& execution_providers,
+                                       KernelRegistryManager& kernel_registry_manager) {
+  bool modified_graph = false;
+
+  auto& graph = partition_params.graph.get();
+  auto& func_mgr = partition_params.func_mgr.get();
+  auto& fused_kernel_registry = partition_params.fused_kernel_registry.get();
+  auto& fused_node_unique_id = partition_params.fused_node_unique_id.get();
+  const auto& transform_layout_function = partition_params.transform_layout_function;
+
+  do {
+    // process full graph with each EP
+    for (const auto& ep : execution_providers) {
+      if(ep->Type() == kWebNNExecutionProvider){
+        ORT_RETURN_IF_ERROR(PostPartitionOnnxFormatModelImpl(graph, func_mgr, kernel_registry_manager,
+                                                        fused_kernel_registry, *ep, mode, fused_node_unique_id,
+                                                        transform_layout_function,
+                                                        partition_params.debug_graph_fn));
+      }
+    }
+
+    // expand any nodes that have an ONNX function definition but no matching ORT kernel.
+    modified_graph = false;
+    ORT_RETURN_IF_ERROR(InlineNodes(graph, modified_graph));
+
+    // Resolve and rerun graph partitioning and inlining if there was a change
+    if (modified_graph) {
+      ORT_RETURN_IF_ERROR(graph.Resolve());
+    }
+  } while (modified_graph);
+
+  return Status::OK();
+}
+
 #endif  // !defined(ORT_MINIMAL_BUILD)
 
 static Status PartitionOrtFormatModelImpl(const PartitionParams& partition_params,
@@ -875,6 +1195,119 @@ static Status PartitionOrtFormatModelImpl(const PartitionParams& partition_param
   return Status::OK();
 }
 
+static Status PostPartitionOrtFormatModelImpl(const PartitionParams& partition_params,
+                                          KernelRegistryManager& kernel_registry_mgr,
+                                          IExecutionProvider& current_ep) {
+  // handle testing edge case where optimizers or constant lifting results in graph with no nodes.
+  // doing it here saves all providers checking for this in GetCapability
+  auto& graph = partition_params.graph.get();
+  if (graph.NumberOfNodes() == 0) {
+    return Status::OK();
+  }
+
+  // recurse into nested graphs first to partition bottom up.
+  for (auto& node : graph.Nodes()) {
+    for (auto& entry : node.GetAttributeNameToMutableSubgraphMap()) {
+      auto& subgraph = *entry.second;
+      PartitionParams subgraph_partition_params = partition_params;
+      subgraph_partition_params.graph = std::ref(subgraph);
+      ORT_RETURN_IF_ERROR(PostPartitionOrtFormatModelImpl(subgraph_partition_params, kernel_registry_mgr, current_ep));
+    }
+  }
+
+  std::vector<std::unique_ptr<ComputeCapability>> capabilities;
+  // clang-format off
+  const auto get_capability_params = GetCapabilityForEPParams{
+      std::ref(graph),
+      std::cref(kernel_registry_mgr),
+      std::ref(current_ep),
+      std::ref(capabilities),
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+      GraphPartitioner::Mode::kOrtFormatLoad,
+      std::cref(partition_params.transform_layout_function),
+      std::cref(partition_params.debug_graph_fn),
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  };
+  // clang-format on
+
+  ORT_RETURN_IF_ERROR(PostGetCapabilityForEP(get_capability_params));
+  if (capabilities.empty()) {
+    return Status::OK();
+  }
+
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  struct CompilationEntry {
+    std::unique_ptr<GraphViewer> viewer;
+    std::reference_wrapper<Node> fused_node;
+    std::reference_wrapper<const ComputeCapability> capability;
+  };
+  std::vector<CompilationEntry> compilation_entries;
+  compilation_entries.reserve(capabilities.size());
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  const std::string& type = current_ep.Type();
+  for (const auto& capability : capabilities) {
+    const IndexedSubGraph& indexed_sub_graph = *capability->sub_graph;
+    const IndexedSubGraph::MetaDef* metadef = indexed_sub_graph.GetMetaDef();
+    if (!metadef) {
+      TryAssignSingleNode(graph, indexed_sub_graph, type);
+    } else {
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+      std::ostringstream oss;
+      oss << type << "_" << metadef->name << "_" << partition_params.fused_node_unique_id++;
+      const std::string node_name = oss.str();
+
+      Node& fused_node = graph.BeginFuseSubGraph(indexed_sub_graph, node_name);
+      fused_node.SetExecutionProviderType(type);
+
+      // create filtered graph viewer for this set of nodes
+      //
+      // TODO: Could avoid the topological sort in the GraphViewer ctor by constructing from an existing
+      // GraphViewer instance instead of the Graph (copying the topological order instead of recalculating).
+      auto viewer = std::make_unique<GraphViewer>(graph, indexed_sub_graph);
+      compilation_entries.push_back(CompilationEntry{std::move(viewer), fused_node, *capability});
+#else   // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Compiling capabilities is not supported in this build.");
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+    }
+  }
+
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  // We will compile the fused nodes one by one, and fuse the subgraph if successful.
+  for (const auto& compilation_entry : compilation_entries) {
+    Node& node = compilation_entry.fused_node;
+    std::vector<NodeComputeInfo> single_node_compute_func;
+    ORT_RETURN_IF_ERROR(current_ep.Compile({IExecutionProvider::FusedNodeAndGraph{node, *compilation_entry.viewer}},
+                                           single_node_compute_func));
+
+    ORT_RETURN_IF(single_node_compute_func.empty(), "single_node_compute_func should have 1 element.");
+    auto& func_mgr = partition_params.func_mgr.get();
+    ORT_RETURN_IF_ERROR(func_mgr.AddFuncInfo(node.Name(), std::move(single_node_compute_func[0])));
+
+    const ComputeCapability& cur_capability = compilation_entry.capability;
+    const IndexedSubGraph& indexed_sub_graph = *cur_capability.sub_graph;
+    const IndexedSubGraph::MetaDef& metadef = *indexed_sub_graph.GetMetaDef();
+
+    KernelDefBuilder builder;
+    BuildFusedKernelDef(builder, metadef, type);
+    auto kernel_def = builder.Build();
+
+    auto& fused_kernel_registry = partition_params.fused_kernel_registry.get();
+    ORT_RETURN_IF_ERROR(fused_kernel_registry.Register(
+        KernelCreateInfo(
+            std::move(kernel_def),
+            [](FuncManager& func_mgr, const OpKernelInfo& info, std::unique_ptr<OpKernel>& out) -> Status {
+              return FunctionKernel::Create(func_mgr, info, out);
+            })));
+
+    // now that we're done compiling we can remove the original nodes from the Graph and wire in the new one
+    graph.FinalizeFuseSubGraph(indexed_sub_graph, node);
+  }
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  return Status::OK();
+}
+
 // Simplified partitioning where custom EPs may produce compiled nodes.
 static Status PartitionOrtFormatModel(const PartitionParams& partition_params,
                                       const ExecutionProviders& execution_providers,
@@ -882,6 +1315,24 @@ static Status PartitionOrtFormatModel(const PartitionParams& partition_params,
   // process full graph with each EP
   for (const auto& ep : execution_providers) {
     ORT_RETURN_IF_ERROR(PartitionOrtFormatModelImpl(partition_params, kernel_registry_manager, *ep));
+  }
+
+  return Status::OK();
+}
+
+// Simplified partitioning where custom EPs may produce compiled nodes.
+static Status PostPartitionOrtFormatModel(const PartitionParams& partition_params,
+                                      const ExecutionProviders& execution_providers,
+                                      KernelRegistryManager& kernel_registry_manager) {
+  // process full graph with each EP
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("log in PostPartitionOrtFormatModel..."));
+  for (const auto& ep : execution_providers) {
+    console.call<void>("log", emscripten::val(ep->Type()));
+    if (ep->Type() == kWebNNExecutionProvider) {
+      console.call<void>("log", emscripten::val("log from webnn..."));
+      ORT_RETURN_IF_ERROR(PostPartitionOrtFormatModelImpl(partition_params, kernel_registry_manager, *ep));
+    }
   }
 
   return Status::OK();
@@ -994,6 +1445,87 @@ Status GraphPartitioner::Partition(Graph& graph, FuncManager& func_mgr,
 #endif  //! defined(ORT_MINIMAL_BUILD)
   } else {
     ORT_RETURN_IF_ERROR(PartitionOrtFormatModel(partition_params,
+                                                providers_, kernel_registry_mgr_));
+  }
+
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  if (!fused_kernel_registry->IsEmpty()) {
+    kernel_registry_mgr_.RegisterKernelRegistry(fused_kernel_registry);
+  }
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  return Status::OK();
+}
+
+Status GraphPartitioner::PostPartition(Graph& graph, FuncManager& func_mgr,
+                                   const layout_transformation::TransformLayoutFunction& transform_layout_function,
+                                   const ConfigOptions& config_options,
+                                   const logging::Logger& logger,
+                                   Mode mode,
+                                   const layout_transformation::DebugGraphFn& debug_graph_fn) const {
+  // It is a greedy partitioning algorithm per provider preferences user provided when calling ONNX RUNTIME right now.
+  // 1. Execution providers' capabilities are checked one by one.
+  // 2. All sub-graphs that an execution provider returns will be assigned to it if it's not assigned yet.
+  //    NOTE: A 'sub-graph' is a subset of nodes within the current Graph instance.
+  //          The control flow nodes have nested Graph instance/s which are also called subgraphs,
+  //          but are completely separate Graph instances and not a subset of nodes within a single Graph instance.
+  // 3. CPU execution provider is expected to be able to run any node and is the last one in execution provider
+  //    preference.
+
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("log from PostPartition..."));
+
+  if (providers_.Empty()) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "No provider specified.");
+  }
+
+#if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  // fused_kernel_registry is preparing the kernels created on the fly for fused sub graph.
+  // It is only visible for current session.
+  std::shared_ptr<KernelRegistry> fused_kernel_registry = std::make_shared<KernelRegistry>();
+
+  // we make sure each fused node name is unique across the entire model for clarity
+  int fused_node_unique_id = 0;
+
+  PartitionParams partition_params{
+      std::ref(graph),
+      std::ref(func_mgr),
+      std::ref(*fused_kernel_registry),
+      std::ref(fused_node_unique_id),
+      std::cref(transform_layout_function),
+      std::cref(debug_graph_fn),
+  };
+
+#else  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  ORT_UNUSED_PARAMETER(func_mgr);
+  ORT_UNUSED_PARAMETER(transform_layout_function);
+  ORT_UNUSED_PARAMETER(debug_graph_fn);
+  PartitionParams partition_params{
+      std::ref(graph),
+  };
+
+#endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  if (mode == Mode::kNormal || mode == Mode::kAssignOnly) {
+#if !defined(ORT_MINIMAL_BUILD)
+    console.call<void>("log", emscripten::val("log before PostPartitionOnnxFormatModel..."));
+    ORT_RETURN_IF_ERROR(PostPartitionOnnxFormatModel(partition_params, mode,
+                                                 providers_, kernel_registry_mgr_));
+
+    bool ep_context_enabled = config_options.GetConfigOrDefault(kOrtSessionOptionEpContextEnable, "0") == "1";
+    std::string ep_context_path = config_options.GetConfigOrDefault(kOrtSessionOptionEpContextFilePath, "");
+    if (ep_context_enabled) {
+      ORT_RETURN_IF_ERROR(CreateEpContextModel(providers_, graph, ep_context_path, logger));
+    }
+#else
+    ORT_UNUSED_PARAMETER(config_options);
+    ORT_UNUSED_PARAMETER(logger);
+    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "ONNX models are not supported in this build.");
+#endif  //! defined(ORT_MINIMAL_BUILD)
+  } else {
+    console.call<void>("log", emscripten::val("log before PostPartitionOrtFormatModel..."));
+    ORT_RETURN_IF_ERROR(PostPartitionOrtFormatModel(partition_params,
                                                 providers_, kernel_registry_mgr_));
   }
 

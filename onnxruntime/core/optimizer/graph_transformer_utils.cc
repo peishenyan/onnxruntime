@@ -281,6 +281,11 @@ InlinedVector<std::unique_ptr<GraphTransformer>> GenerateTransformers(
                                                                       onnxruntime::kCudaExecutionProvider,
                                                                       onnxruntime::kRocmExecutionProvider,
                                                                       onnxruntime::kDmlExecutionProvider};
+      const InlinedHashSet<std::string_view> cpu_cuda_dml_rocm_webnn_eps = {onnxruntime::kCpuExecutionProvider,
+                                                                      onnxruntime::kCudaExecutionProvider,
+                                                                      onnxruntime::kRocmExecutionProvider,
+                                                                      onnxruntime::kDmlExecutionProvider,
+                                                                      onnxruntime::kWebNNExecutionProvider};
       const InlinedHashSet<std::string_view> cpu_cuda_rocm_acl_armnn_js_eps = {onnxruntime::kCpuExecutionProvider,
                                                                                onnxruntime::kCudaExecutionProvider,
                                                                                onnxruntime::kRocmExecutionProvider,
@@ -312,7 +317,7 @@ InlinedVector<std::unique_ptr<GraphTransformer>> GenerateTransformers(
       transformers.emplace_back(std::make_unique<ConvActivationFusion>(cpu_cuda_rocm_acl_armnn_js_eps));
 
       transformers.emplace_back(std::make_unique<GeluFusion>(cpu_cuda_dml_rocm_eps));
-      transformers.emplace_back(std::make_unique<LayerNormFusion>(cpu_cuda_dml_rocm_eps));
+      transformers.emplace_back(std::make_unique<LayerNormFusion>(cpu_cuda_dml_rocm_webnn_eps));
       transformers.emplace_back(std::make_unique<SimplifiedLayerNormFusion>(cpu_cuda_rocm_eps));
       transformers.emplace_back(std::make_unique<AttentionFusion>(cpu_cuda_dml_rocm_eps));
       transformers.emplace_back(std::make_unique<EmbedLayerNormFusion>(cpu_cuda_dml_rocm_eps));

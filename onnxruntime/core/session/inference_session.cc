@@ -1242,6 +1242,14 @@ common::Status InferenceSession::TransformGraph(onnxruntime::Graph& graph, bool 
         graph_transformer_mgr_.ApplyTransformers(graph, static_cast<TransformerLevel>(i), *session_logger_));
   }
 
+  #ifdef USE_WEBNN
+  // Do partitioning based on execution providers' capabilities.
+  ORT_RETURN_IF_ERROR_SESSIONID_(partitioner.PostPartition(graph, session_state_->GetMutableFuncMgr(), transform_layout_fn,
+                                                       session_options_.config_options, *session_logger_,
+                                                       mode, debug_graph_fn));
+
+  #endif
+
   // Insert cast node/s.
   {
     const InlinedVector<gsl::not_null<const KernelRegistry*>> kernel_regs =

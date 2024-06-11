@@ -27,6 +27,10 @@ class WebNNExecutionProvider : public IExecutionProvider {
   GetCapability(const onnxruntime::GraphViewer& graph_viewer,
                 const IKernelLookup& /*kernel_registries*/) const override;
 
+  std::vector<std::unique_ptr<ComputeCapability>>
+  PostGetCapability(const onnxruntime::GraphViewer& graph_viewer,
+                const IKernelLookup& /*kernel_registries*/) const override;
+
   DataLayout GetPreferredLayout() const override { return preferred_layout_; }
 
   // We implement the Compile that takes FusedNodeAndGraph instances.
