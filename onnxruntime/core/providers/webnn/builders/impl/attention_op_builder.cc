@@ -317,11 +317,11 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   options.set("label", node.Name() + "/GQA/present_key/transpose");
   true_present_key = model_builder.GetBuilder().call<emscripten::val>("transpose", true_present_key, options);
 
-  common_options.set("label", node.Name() + "/GQA/qkv/matmul_1");
-  emscripten::val matmul_output =
-      model_builder.GetBuilder().call<emscripten::val>("matmul", new_query, true_present_key, common_options);
+  // common_options.set("label", node.Name() + "/GQA/qkv/matmul_1");
+  // emscripten::val matmul_output =
+  //     model_builder.GetBuilder().call<emscripten::val>("matmul", new_query, true_present_key, common_options);
 
-  std::vector<float> scale({static_cast<float>(sqrt(head_size))});
+  std::vector<float> scale({static_cast<float>(1/sqrt(head_size))});
   emscripten::val desc_scale = emscripten::val::object();
   ORT_RETURN_IF_NOT(SetWebnnDataType(desc_scale, ONNX_NAMESPACE::TensorProto_DataType_FLOAT), "Unsupported data type");
   emscripten::val dims_scale = emscripten::val::array(std::vector<uint32_t>({1}));
@@ -331,9 +331,9 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val scale_constant =
       model_builder.GetBuilder().call<emscripten::val>("constant", desc_scale, scale_buffer);
 
-  common_options.set("label", node.Name() + "/GQA/qkv/div");
-  emscripten::val div_output =
-      model_builder.GetBuilder().call<emscripten::val>("div", matmul_output, scale_constant, common_options);
+  // common_options.set("label", node.Name() + "/GQA/qkv/div");
+  // emscripten::val div_output =
+  //     model_builder.GetBuilder().call<emscripten::val>("div", matmul_output, scale_constant, common_options);
 
   // static_cast<int64_t>(batch_size), static_cast<int64_t>(num_heads), static_cast<int64_t>(qkv_sequence_length),
   // static_cast<int64_t>(past_sequence_length)
@@ -414,27 +414,31 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val attn_mask = model_builder.GetBuilder().call<emscripten::val>("where", condition, value_one_constant,
                                                                                finfo_min_constant, common_options);
 
-  common_options.set("label", node.Name() + "/GQA/attn_mask/softmax_input");
-  emscripten::val softmax_input =
-      model_builder.GetBuilder().call<emscripten::val>("add", div_output, attn_mask, common_options);
+  // common_options.set("label", node.Name() + "/GQA/attn_mask/softmax_input");
+  // emscripten::val softmax_input =
+  //     model_builder.GetBuilder().call<emscripten::val>("add", div_output, attn_mask, common_options);
 
-  common_options.set("label", node.Name() + "/GQA/attn_mask/softmax_input");
-  int32_t softmax_axis = 3;
-  emscripten::val softmax_output =
-      model_builder.GetBuilder().call<emscripten::val>("softmax", softmax_input, softmax_axis, common_options);
+  // common_options.set("label", node.Name() + "/GQA/attn_mask/softmax_input");
+  // int32_t softmax_axis = 3;
+  // emscripten::val softmax_output =
+  //     model_builder.GetBuilder().call<emscripten::val>("softmax", softmax_input, softmax_axis, common_options);
 
-  common_options.set("label", node.Name() + "/GQA/qkv/matmul_2");
-  emscripten::val attn_output =
-      model_builder.GetBuilder().call<emscripten::val>("matmul", softmax_output, true_present_value, common_options);
+  // common_options.set("label", node.Name() + "/GQA/qkv/matmul_2");
+  // emscripten::val attn_output =
+  //     model_builder.GetBuilder().call<emscripten::val>("matmul", softmax_output, true_present_value, common_options);
 
-  options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
-  options.set("label", node.Name() + "/GQA/qkv/transpose");
-  emscripten::val transposed_attn_output =
-      model_builder.GetBuilder().call<emscripten::val>("transpose", attn_output, options);
+  // options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+  // options.set("label", node.Name() + "/GQA/qkv/transpose");
+  // emscripten::val transposed_attn_output =
+  //     model_builder.GetBuilder().call<emscripten::val>("transpose", attn_output, options);
 
-  common_options.set("label", node.Name() + "/GQA/qkv/reshape");
-  emscripten::val output = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", transposed_attn_output, emscripten::val::array(reshape_output_shape), common_options);
+  // common_options.set("label", node.Name() + "/GQA/qkv/reshape");
+  // emscripten::val output = model_builder.GetBuilder().call<emscripten::val>(
+  //     "reshape", transposed_attn_output, emscripten::val::array(reshape_output_shape), common_options);
+
+  emscripten::val output =
+      ScaledDotProductAttention(model_builder, node, logger, new_query, true_present_key, true_present_value, scale_constant,
+                                attn_mask, reshape_output_shape);
 
   if (node.OutputDefs()[0]->Type() == onnx::Utils::DataTypeUtils::ToType("float16")) {
     common_options.set("label", node.Name() + "/GQA/postprocess/cast/output");
